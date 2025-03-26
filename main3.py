@@ -159,6 +159,15 @@ class TelegramModerator:
                 await update.message.delete()
                 logger.info(f"Media + izohli xabar o'chirildi")
                 return
+
+            # APK fayllarni tekshirish va o'chirish
+            if update.message.document:
+                file_name = update.message.document.file_name or ""
+                if file_name.lower().endswith('.apk'):
+                    await update.message.delete()
+                    logger.info(f"APK fayl o'chirildi: {file_name}")
+                    return
+        
                 
         except Exception as e:
             logger.error(f"Xabarni tekshirishda xatolik: {e}")
