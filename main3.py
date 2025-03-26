@@ -125,28 +125,41 @@ class TelegramModerator:
             if re.search(r'\b' + re.escape(word) + r'\b', text):
                 return True
         return False
-
     async def check_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if not update.message:
                 return
+                
+            # Admin va creatorlarni tekshirish
             member = await context.bot.get_chat_member(update.message.chat_id, update.message.from_user.id)
             if member.status in ['administrator', 'creator', 'left']:
                 return
+                
+            # Matn va captionni olish
             text = update.message.text or update.message.caption or ""
             text = text.lower()
+            
+            # Haqoratli so'zlarni tekshirish
             if self._contains_offensive_words(text):
                 await update.message.delete()
                 logger.info(f"Haqoratli xabar o'chirildi: {text}")
                 return
+                
+            # Havolalarni tekshirish (YouTube linklaridan tashqari)
             if self._contains_links(text, update.message):
                 await update.message.delete()
                 logger.info(f"Havolali xabar o'chirildi: {text}")
                 return
-            if update.message.photo or update.message.video or update.message.document:
+                
+            # Faqat rasm/video + izoh mavjud bo'lsa o'chirish
+            has_media = update.message.photo or update.message.video or update.message.document
+            has_caption = bool(update.message.caption)
+            
+            if has_media and has_caption:
                 await update.message.delete()
-                logger.info(f"Media xabar o'chirildi")
+                logger.info(f"Media + izohli xabar o'chirildi")
                 return
+                
         except Exception as e:
             logger.error(f"Xabarni tekshirishda xatolik: {e}")
 
@@ -157,16 +170,27 @@ class TelegramModerator:
         )
         links = url_pattern.findall(text)
         allowed_domains = ['youtube.com', 'youtu.be']
+        
+        # Har bir linkni tekshirish
         for link in links:
-            if not any(domain in link for domain in allowed_domains) and not link.startswith('@'):
+            # YouTube linklari va mentionlarni o'tkazib yuboramiz
+            if any(domain in link for domain in allowed_domains) or link.startswith('@'):
+                continue
+            return True
+            
+        # Entity'larni tekshirish
+        entities = message.entities or message.caption_entities or []
+        for entity in entities:
+            if entity.type in ['url', 'text_link']:
+                url = text[entity.offset:entity.offset + entity.length]
+                if any(domain in url for domain in allowed_domains):
+                    continue
                 return True
-        entities = message.entities or message.caption_entities
-        if entities:
-            for entity in entities:
-                if entity.type in ['url', 'text_link', 'mention']:
-                    return True
+            elif entity.type == 'mention':
+                continue
+                
         return False
-
+    
     async def add_offensive_word(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Iltimos, so'zni kiriting. Masalan: /addword yomon")
