@@ -125,19 +125,25 @@ class TelegramModerator:
             if re.search(r'\b' + re.escape(word) + r'\b', text):
                 return True
         return False
+   
+   
     async def check_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if not update.message:
+                logger.info("Xabar topilmadi (update.message yo'q)")
                 return
                 
             # Admin va creatorlarni tekshirish
             member = await context.bot.get_chat_member(update.message.chat_id, update.message.from_user.id)
+            logger.info(f"Foydalanuvchi statusi: {member.status}")
             if member.status in ['administrator', 'creator', 'left']:
+                logger.info("Foydalanuvchi admin yoki creator, tekshiruv o'tkazib yuborildi")
                 return
                 
             # Matn va captionni olish
             text = update.message.text or update.message.caption or ""
             text = text.lower()
+            logger.info(f"Xabar matni yoki caption: {text}")
             
             # Haqoratli so'zlarni tekshirish
             if self._contains_offensive_words(text):
@@ -151,27 +157,34 @@ class TelegramModerator:
                 logger.info(f"Havolali xabar o'chirildi: {text}")
                 return
                 
+            # APK fayllarni tekshirish va o'chirish
+            if update.message.document:
+                file_name = update.message.document.file_name or ""
+                logger.info(f"Hujjat topildi, fayl nomi: {file_name}")
+                if file_name.lower().endswith('.apk'):
+                    await update.message.delete()
+                    logger.info(f"APK fayl o'chirildi: {file_name}")
+                    return
+                else:
+                    logger.info(f"Fayl .apk emas: {file_name}")
+            else:
+                logger.info("Xabarda hujjat (document) topilmadi")
+                
             # Faqat rasm/video + izoh mavjud bo'lsa o'chirish
             has_media = update.message.photo or update.message.video or update.message.document
             has_caption = bool(update.message.caption)
+            logger.info(f"Media: {has_media}, Caption: {has_caption}")
             
             if has_media and has_caption:
                 await update.message.delete()
                 logger.info(f"Media + izohli xabar o'chirildi")
                 return
-
-            # APK fayllarni tekshirish va o'chirish
-            if update.message.document:
-                file_name = update.message.document.file_name or ""
-                if file_name.lower().endswith('.apk'):
-                    await update.message.delete()
-                    logger.info(f"APK fayl o'chirildi: {file_name}")
-                    return
-        
                 
         except Exception as e:
             logger.error(f"Xabarni tekshirishda xatolik: {e}")
-
+    
+   
+   
     def _contains_links(self, text, message):
         url_pattern = re.compile(
             r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+|www\.\S+|@[\w]+',
@@ -302,7 +315,7 @@ def main():
         application.add_handler(CommandHandler('showwords', moderator.show_offensive_words))
 
         application.add_handler(CallbackQueryHandler(moderator.button_handler))
-
+        application.add_handler(MessageHandler(filters.Document.ALL, moderator.check_message))
         application.add_handler(MessageHandler(filters.TEXT, moderator.check_message))
         application.add_handler(MessageHandler(filters.PHOTO, moderator.check_message))
         application.add_handler(MessageHandler(filters.VIDEO, moderator.check_message))
