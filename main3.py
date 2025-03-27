@@ -4,6 +4,7 @@ import logging
 import re
 from datetime import datetime
 import time
+import asyncio
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
@@ -125,8 +126,7 @@ class TelegramModerator:
             if re.search(r'\b' + re.escape(word) + r'\b', text):
                 return True
         return False
-   
-   
+
     async def check_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if not update.message:
@@ -145,7 +145,7 @@ class TelegramModerator:
             text = text.lower()
             logger.info(f"Xabar matni yoki caption: {text}")
             
-            # Haqoratli so'zlarni tekshirish
+            # Haqoratli so'zlarni tekshirish (matn uchun)
             if self._contains_offensive_words(text):
                 await update.message.delete()
                 logger.info(f"Haqoratli xabar o'chirildi: {text}")
@@ -170,21 +170,63 @@ class TelegramModerator:
             else:
                 logger.info("Xabarda hujjat (document) topilmadi")
                 
-            # Faqat rasm/video + izoh mavjud bo'lsa o'chirish
+            # Guruhlangan xabarlarni tekshirish
+            if update.message.media_group_id:
+                logger.info(f"Guruhlangan xabar aniqlandi, media_group_id: {update.message.media_group_id}")
+                has_caption = bool(update.message.caption)
+                if has_caption and self._contains_offensive_words(update.message.caption.lower()):
+                    # Guruhlangan xabarning barcha qismlarini o'chirish
+                    await self.handle_media_group(update, context)
+                    return
+                else:
+                    logger.info("Guruhlangan xabarda haqoratli izoh yo'q, xabar qoldirildi")
+                    return
+                
+            # Oddiy rasm/video + izoh mavjud bo'lsa va izohda haqoratli so'z bo'lsa o'chirish
             has_media = update.message.photo or update.message.video or update.message.document
             has_caption = bool(update.message.caption)
             logger.info(f"Media: {has_media}, Caption: {has_caption}")
             
             if has_media and has_caption:
-                await update.message.delete()
-                logger.info(f"Media + izohli xabar o'chirildi")
-                return
+                if self._contains_offensive_words(update.message.caption.lower()):
+                    await update.message.delete()
+                    logger.info(f"Media + haqoratli izohli xabar o'chirildi: {update.message.caption}")
+                    return
+                else:
+                    logger.info("Izohda haqoratli so'z yo'q, xabar qoldirildi")
                 
         except Exception as e:
             logger.error(f"Xabarni tekshirishda xatolik: {e}")
-    
-   
-   
+
+    async def handle_media_group(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        try:
+            media_group_id = update.message.media_group_id
+            chat_id = update.message.chat_id
+            logger.info(f"Guruhlangan xabarni o'chirish boshlandi, media_group_id: {media_group_id}")
+
+            # Guruhlangan xabarlarni o'chirish uchun qisqa vaqt kutiladi
+            await asyncio.sleep(1)  # 1 soniya kutamiz, barcha xabarlar kelishini kutish uchun
+
+            # Chat tarixidan so'nggi xabarlarni olish
+            messages = await context.bot.get_chat_history(chat_id=chat_id, limit=10)
+            messages_to_delete = []
+
+            for msg in messages:
+                if msg.media_group_id == media_group_id:
+                    messages_to_delete.append(msg.message_id)
+
+            # Barcha guruhlangan xabarlarni o'chirish
+            for message_id in messages_to_delete:
+                try:
+                    await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+                    logger.info(f"Guruhlangan xabar o'chirildi, message_id: {message_id}")
+                except Exception as e:
+                    logger.error(f"Guruhlangan xabarni o'chirishda xatolik, message_id: {message_id}, xatolik: {e}")
+
+            logger.info(f"Guruhlangan xabarlar to'liq o'chirildi, media_group_id: {media_group_id}")
+        except Exception as e:
+            logger.error(f"Guruhlangan xabarni qayta ishlashda xatolik: {e}")
+
     def _contains_links(self, text, message):
         url_pattern = re.compile(
             r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+|www\.\S+|@[\w]+',
@@ -193,14 +235,11 @@ class TelegramModerator:
         links = url_pattern.findall(text)
         allowed_domains = ['youtube.com', 'youtu.be']
         
-        # Har bir linkni tekshirish
         for link in links:
-            # YouTube linklari va mentionlarni o'tkazib yuboramiz
             if any(domain in link for domain in allowed_domains) or link.startswith('@'):
                 continue
             return True
             
-        # Entity'larni tekshirish
         entities = message.entities or message.caption_entities or []
         for entity in entities:
             if entity.type in ['url', 'text_link']:
@@ -212,7 +251,7 @@ class TelegramModerator:
                 continue
                 
         return False
-    
+
     async def add_offensive_word(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
             await update.message.reply_text("Iltimos, so'zni kiriting. Masalan: /addword yomon")
