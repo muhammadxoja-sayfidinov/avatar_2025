@@ -11,9 +11,10 @@ import ahocorasick
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    filters, ContextTypes, JobQueue # JobQueue импорт қилинди
+    filters, ContextTypes, JobQueue
 )
 from dotenv import load_dotenv
+from telegram.ext.filters import Sticker  # Sticker субмодулини импорт қилиш
 
 # --- Конфигурация ва Logging (ўзгаришсиз) ---
 load_dotenv()
@@ -328,7 +329,7 @@ class TelegramModerator:
             # 3 сониядан кейин process_media_group ни ишга туширамиз
             context.job_queue.run_once(
                 self.process_media_group,
-                when=timedelta(seconds=3), # 3 сония кутамиз
+                when=timedelta(seconds=2), # 3 сония кутамиз
                 data={'chat_id': chat_id, 'media_group_id': media_group_id},
                 name=job_name
             )
@@ -554,10 +555,10 @@ def main():
         # Message Handler'лар (асосий текширув учун)
         # Энг кенг тарқалган фильтрларни юқорига қўямиз
         message_filters = (
-            filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.AUDIO |
-            filters.VOICE | filters.VIDEO_NOTE | filters.STICKER | filters.CONTACT |
-            filters.LOCATION | filters.VENUE | filters.POLL | filters.Document.ALL # Ҳужжатлар
-        ) & (~filters.UpdateType.EDITED_MESSAGE) & (~filters.StatusUpdate.WEB_APP_DATA) # Таҳрирланган хабарларни ҳозирча эътиборсиз қолдирамиз
+    filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.AUDIO |
+    filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL | filters.CONTACT |  # filters.STICKER ўрнига
+    filters.LOCATION | filters.VENUE | filters.POLL | filters.Document.ALL
+) & (~filters.UpdateType.EDITED_MESSAGE) & (~filters.StatusUpdate.WEB_APP_DATA)
 
         application.add_handler(MessageHandler(message_filters, moderator.check_message))
 
