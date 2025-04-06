@@ -250,7 +250,7 @@ class TelegramModerator:
             if update.message.chat.type != Chat.PRIVATE:
                 member = await context.bot.get_chat_member(chat_id, user_id)
                 # logger.info(f"Foydalanuvchi statusi ({user_id} in {chat_id}): {member.status}")
-                if member.status in ['administrator', 'creator']:
+                if member.status in ['administrator', 'creator','left']:
                     # logger.info("Foydalanuvchi admin yoki creator, tekshiruv o'tkazib yuborildi")
                     return
 
@@ -509,7 +509,7 @@ class TelegramModerator:
                 # Админ ва creator'ларни текшириш (гуруҳларда)
                 if update.message.chat.type != Chat.PRIVATE:
                      member = await context.bot.get_chat_member(chat_id, user_id)
-                     if member.status in ['administrator', 'creator']:
+                     if member.status in ['administrator', 'creator','left']:
                          return # Админларникини ўчирмаймиз
 
                 await update.message.delete()
