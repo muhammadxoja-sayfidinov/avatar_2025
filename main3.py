@@ -8,6 +8,7 @@ import functools # Декоратор учун
 
 # Янги қўшилган импортлар
 import ahocorasick
+import telegram # telegram.error.Forbidden учун
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Chat
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -16,7 +17,7 @@ from telegram.ext import (
 from dotenv import load_dotenv
 from telegram.ext.filters import Sticker  # Sticker субмодулини импорт қилиш
 
-# --- Конфигурация ва Logging (ўзгаришсиз) ---
+# --- Конфигурация ва Logging ---
 load_dotenv()
 TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'default_token')
 OWNER_ID = int(os.getenv('OWNER_ID', 0)) # OWNER_ID энди муҳим
@@ -28,7 +29,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- OffensiveWordManager синфи (ўзгаришсиз) ---
+# --- OffensiveWordManager синфи ---
 class OffensiveWordManager:
     def __init__(self, db_path='bot_data.db'):
         self.db_path = db_path
@@ -102,9 +103,9 @@ class OffensiveWordManager:
             with self._get_connection() as conn:
                 cursor = conn.cursor()
                 if limit:
-                    cursor.execute("SELECT word FROM offensive_words LIMIT ?", (limit,))
+                    cursor.execute("SELECT word FROM offensive_words ORDER BY added_at DESC LIMIT ?", (limit,)) # Yangilarini ko'rsatish uchun tartiblash
                 else:
-                    cursor.execute("SELECT word FROM offensive_words")
+                    cursor.execute("SELECT word FROM offensive_words ORDER BY added_at DESC") # Yangilarini ko'rsatish uchun tartiblash
                 return [row[0] for row in cursor.fetchall()]
         except sqlite3.Error as e:
             logger.error(f"So'zlarni olishda xatolik: {e}")
@@ -136,7 +137,7 @@ def owner_only(func):
         return await func(update, context, *args, **kwargs)
     return wrapped
 
-# --- TelegramModerator синфи (ўзгартирилган) ---
+# --- TelegramModerator синфи ---
 class TelegramModerator:
     def __init__(self, token, application: Application): # Application'ни қабул қиламиз
         self.word_manager = OffensiveWordManager()
@@ -147,17 +148,20 @@ class TelegramModerator:
         self._rebuild_automaton() # Бошланишида қурамиз
 
         # Рухсат этилмаган контент учун Regex'лар
+        # YouTube ва googleusercontent.com доменларини истисно қилиш
         self.link_pattern = re.compile(
-             # Оддий URLлар, www. билан бошланадиганлар (YouTube'дан ташқари)
-             r'http[s]?://(?!.*(?:youtube\.com/watch|youtu\.be/|youtube\.com/shorts|m\.youtube\.com))[a-zA-Z0-9./?=&-_%]+' +
-             r'|' +
-             r'www\.(?!.*(?:youtube\.com/watch|youtu\.be/|youtube\.com/shorts|m\.youtube\.com))[a-zA-Z0-9./?=&-_%]+',
+            r'http[s]?://(?!.*(?:youtube\.com/watch|youtu\.be/|youtube\.com/shorts|m\.youtube\.com|googleusercontent\.com))[a-zA-Z0-9./?=&-_%]+' +
+            r'|' +
+            r'www\.(?!.*(?:youtube\.com/watch|youtu\.be/|youtube\.com/shorts|m\.youtube\.com|googleusercontent\.com))[a-zA-Z0-9./?=&-_%]+',
             re.IGNORECASE
         )
         # Камида 5 белгили username'лар (@ билан)
         self.mention_pattern = re.compile(r'@[\w]{5,}')
         # Медиа гуруҳларни сақлаш учун луғат (key: media_group_id)
-        self.media_group_cache = {} # Эски bot_data ўрнига синф атрибути
+        self.media_group_cache = {} # Синф атрибути
+
+        # Рухсат этилган доменлар рўйхати (text_link учун)
+        self.allowed_domains = ['youtube.com', 'youtu.be', 'googleusercontent.com']
 
 
     def _rebuild_automaton(self):
@@ -172,72 +176,73 @@ class TelegramModerator:
             self.A.make_automaton()
             logger.info(f"Automaton {len(offensive_words)} сўз билан қурилди.")
         else:
-             logger.info("Ҳақоратли сўзлар рўйхати бўш, automaton қурилмади.")
+            logger.info("Ҳақоратли сўзлар рўйхати бўш, automaton қурилмади.")
 
 
     def _contains_offensive_words(self, text):
         """Aho-Corasick орқали ҳақоратли сўзларни текширади."""
         if not text or not self.A.kind == ahocorasick.AHOCORASICK: # Агар automaton қурилмаган бўлса
             return False
-        text = text.lower()
+        text_lower = text.lower()
         # Automaton'дан фойдаланиб текшириш
-        for end_index, found_word in self.A.iter(text):
-             # Тўлиқ сўз мослигини текшириш (масалан, 'ass' 'massage' ичида топилмаслиги учун)
-             start_index = end_index - len(found_word) + 1
-             # Сўз бошида ёки олдида бўшлиқ/пунктуация борми?
-             is_start_boundary = start_index == 0 or not text[start_index - 1].isalnum()
-             # Сўз охирида ёки кейинида бўшлиқ/пунктуация борми?
-             is_end_boundary = end_index == len(text) - 1 or not text[end_index + 1].isalnum()
+        for end_index, found_word in self.A.iter(text_lower):
+            # Тўлиқ сўз мослигини текшириш
+            start_index = end_index - len(found_word) + 1
+            is_start_boundary = start_index == 0 or not text_lower[start_index - 1].isalnum()
+            is_end_boundary = end_index == len(text_lower) - 1 or not text_lower[end_index + 1].isalnum()
 
-             if is_start_boundary and is_end_boundary:
+            if is_start_boundary and is_end_boundary:
                 logger.info(f"Ҳақоратли сўз топилди: '{found_word}' матнда: '{text[:50]}...'")
                 return True # Биринчи топилган сўздаёқ тўхтаймиз
         return False
 
     def _contains_disallowed_content(self, text, message: Update.message):
         """Рухсат этилмаган ҳаволалар ёки mention'ларни текширади."""
-        if not text: return None # Агар матн бўлмаса, бузмаймиз
+        if not text: return None # Агар матн бўлмаса
 
-        text_lower = text.lower()
-
-        # Рухсат этилмаган ҳаволаларни қидириш
-        if self.link_pattern.search(text_lower):
-            logger.info(f"Рухсат этилмаган ҳавола топилди: {text[:50]}...")
+        # Regex орқали текшириш (оддий URL ва www.)
+        if self.link_pattern.search(text):
+            logger.info(f"Regex орқали рухсат этилмаган ҳавола топилди: {text[:50]}...")
             return "link"
 
-        # Mention'ларни қидириш (@username)
-        if self.mention_pattern.search(text_lower):
-             # Ўзини-ўзи mention қилишни ёки ботни mention қилишни ўтказиб юбориш (ихтиёрий)
-             # if message.from_user and f"@{message.from_user.username}" in text: pass
-             # bot_username = context.bot.username # Буни олиш керак бўлади
-             # if f"@{bot_username}" in text: pass
+        # Regex орқали mention текшириш (@username)
+        if self.mention_pattern.search(text):
             logger.info(f"Mention топилди: {text[:50]}...")
             return "mention"
 
-        # Message Entities орқали текшириш (text_link учун)
+        # Message Entities орқали текшириш (URL ва text_link учун)
         entities = message.entities or message.caption_entities or []
-        allowed_domains = ['youtube.com/watch', 'youtu.be/', 'youtube.com/shorts', 'm.youtube.com'] # Рухсат этилган доменлар
-
         for entity in entities:
+            url_to_check = None
             if entity.type == 'url': # Оддий URL http://...
-                url = text[entity.offset : entity.offset + entity.length].lower()
-                if not any(domain in url for domain in allowed_domains):
-                    logger.info(f"Entity орқали рухсат этилмаган URL топилди: {url}")
-                    return "link"
+                url_to_check = text[entity.offset : entity.offset + entity.length]
             elif entity.type == 'text_link': # Гиперҳавола [text](url)
-                 url = entity.url.lower()
-                 if not any(domain in url for domain in allowed_domains):
-                    logger.info(f"Entity орқали рухсат этилмаган text_link топилди: {url}")
+                 url_to_check = entity.url
+
+            if url_to_check:
+                url_lower = url_to_check.lower()
+                # Биронта рухсат этилган домен билан бошланадими ёки ўз ичига оладими?
+                is_allowed = False
+                for domain in self.allowed_domains:
+                    # Текширувни яхшилаш: 'google.com' 'notgoogle.com'га мос тушмаслиги учун
+                    if f"//{domain}" in url_lower or f"www.{domain}" in url_lower:
+                         is_allowed = True
+                         break
+                if not is_allowed:
+                    logger.info(f"Entity ({entity.type}) орқали рухсат этилмаган ҳавола топилди: {url_to_check}")
                     return "link"
-            # elif entity.type == 'mention': # @username entity турини ҳам текшириш мумкин
-            #     logger.info(f"Entity орқали mention топилди: {text[entity.offset : entity.offset + entity.length]}")
-            #     return "mention" # Юқоридаги regex билан бирга ишлаши мумкин
+
+            # Mention'ларни entity орқали текшириш (ихтиёрий, regex билан биргаликда)
+            # elif entity.type == 'mention':
+            #     mention_text = text[entity.offset : entity.offset + entity.length]
+            #     if len(mention_text) >= 6: # @ + камида 5 белги
+            #         logger.info(f"Entity орқали mention топилди: {mention_text}")
+            #         return "mention"
 
         return None # Ҳеч нарса топилмади
 
     async def check_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not update.message:
-            # logger.info("Xabar topilmadi (update.message yo'q)")
+        if not update.message or not update.message.from_user: # Агар хабар ёки фойдаланувчи бўлмаса
             return
 
         chat_id = update.message.chat_id
@@ -245,13 +250,17 @@ class TelegramModerator:
         message_id = update.message.message_id
         media_group_id = update.message.media_group_id
 
+        # OWNER_ID ни ҳар доим ўтказиб юбориш (гуруҳда ҳам)
+        if user_id == OWNER_ID:
+            # logger.debug(f"Owner (ID: {user_id}) хабари текширилмади.")
+            return
+
         try:
             # Админ ва creatorларни текшириш (гуруҳларда)
             if update.message.chat.type != Chat.PRIVATE:
                 member = await context.bot.get_chat_member(chat_id, user_id)
-                # logger.info(f"Foydalanuvchi statusi ({user_id} in {chat_id}): {member.status}")
                 if member.status in ['administrator', 'creator','left']:
-                    # logger.info("Foydalanuvchi admin yoki creator, tekshiruv o'tkazib yuborildi")
+                    # logger.debug(f"Admin/Creator (ID: {user_id}) хабари текширилмади.")
                     return
 
             # Матн ва caption'ни олиш
@@ -282,13 +291,15 @@ class TelegramModerator:
                 logger.info(f"Xabarni o'chirish сабаби: '{delete_reason}'. User ID: {user_id}, Chat ID: {chat_id}, Msg ID: {message_id}")
 
                 if media_group_id:
-                     # Медиа гуруҳга тегишли бўлса, кэшга белги қўямиз
-                     await self.schedule_media_group_check(context, chat_id, media_group_id, message_id, delete_required=True)
+                    # Медиа гуруҳга тегишли бўлса, кэшга белги қўямиз
+                    await self.schedule_media_group_check(context, chat_id, media_group_id, message_id, delete_required=True)
                 else:
                     # Оддий хабар бўлса, дарҳол ўчирамиз
                     try:
                         await update.message.delete()
                         logger.info(f"Xabar (ID: {message_id}) muvaffaqiyatli o'chirildi ({delete_reason}).")
+                    except telegram.error.Forbidden as e:
+                        logger.error(f"Xabarni (ID: {message_id}) o'chirish uchun ruxsat yo'q: {e}")
                     except Exception as e:
                         logger.error(f"Xabarni (ID: {message_id}) o'chirishda xatolik: {e}")
                 return # Текширувни тугатамиз, чунки сабаб топилди
@@ -298,7 +309,11 @@ class TelegramModerator:
             elif media_group_id:
                  await self.schedule_media_group_check(context, chat_id, media_group_id, message_id, delete_required=False)
 
-
+        except telegram.error.BadRequest as e:
+             if "member not found" in str(e).lower():
+                 logger.warning(f"Foydalanuvchi (ID: {user_id}) chat ({chat_id}) a'zosi emas. Tekshirish o'tkazib yuborildi.")
+             else:
+                 logger.error(f"Xabarni tekshirishda BadRequest xatoligi (Msg ID: {message_id}): {e}", exc_info=True)
         except Exception as e:
             logger.error(f"Xabarni tekshirishda umumiy xatolik (Msg ID: {message_id}): {e}", exc_info=True)
 
@@ -326,17 +341,15 @@ class TelegramModerator:
 
         # Агар текшириш ҳали режалаштирилмаган бўлса
         if not group_data['job_scheduled']:
-            # 3 сониядан кейин process_media_group ни ишга туширамиз
+            # 2 сониядан кейин process_media_group ни ишга туширамиз (олдин 3 эди)
             context.job_queue.run_once(
                 self.process_media_group,
-                when=timedelta(seconds=2), # 3 сония кутамиз
+                when=timedelta(seconds=2), # 2 сония кутамиз
                 data={'chat_id': chat_id, 'media_group_id': media_group_id},
                 name=job_name
             )
             group_data['job_scheduled'] = True
             logger.info(f"Media guruh ({media_group_id}) uchun tekshirish {job_name} номи билан режалаштирилди.")
-        # else:
-            # logger.debug(f"Media guruh ({media_group_id}) uchun tekshirish allaqachon rejalashtirilgan.")
 
 
     async def process_media_group(self, context: ContextTypes.DEFAULT_TYPE):
@@ -353,22 +366,34 @@ class TelegramModerator:
 
             if group_data['delete_required']:
                 logger.warning(f"Media guruh ({media_group_id}) ўчирилмоқда. Хабарлар: {message_ids_to_delete}")
-                deleted_count = 0
-                for msg_id in message_ids_to_delete:
-                    try:
-                        await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
-                        deleted_count += 1
-                        await asyncio.sleep(0.1) # Кичик танаффус (flood wait олдини олиш учун)
-                    except Exception as e:
-                        # Агар хабар аллақачон ўчирилган бўлса ёки бошқа хато
-                        logger.error(f"Media guruh хабарини (ID: {msg_id}) ўчиришда хато: {e}")
-                logger.info(f"Media guruh ({media_group_id}) дан {deleted_count}/{len(message_ids_to_delete)} хабар ўчирилди.")
+                try:
+                    # Бир нечта хабарни бирданига ўчиришга ҳаракат қилиш
+                    await context.bot.delete_messages(chat_id=chat_id, message_ids=message_ids_to_delete)
+                    logger.info(f"Media guruh ({media_group_id}) дан {len(message_ids_to_delete)} хабар delete_messages орқали ўчирилди.")
+                except telegram.error.BadRequest as e:
+                     # Агар delete_messages ишламаса (эски хабарлар, бошқа сабаб), яккама-якка ўчирамиз
+                     logger.warning(f"delete_messages хато берди ({e}), хабарларни яккама-якка ўчиришга ҳаракат қилинади.")
+                     deleted_count = 0
+                     for msg_id in message_ids_to_delete:
+                         try:
+                             await context.bot.delete_message(chat_id=chat_id, message_id=msg_id)
+                             deleted_count += 1
+                             await asyncio.sleep(0.1) # Кичик танаффус
+                         except Exception as single_e:
+                             logger.error(f"Media guruh хабарини (ID: {msg_id}) яккама-якка ўчиришда хато: {single_e}")
+                     logger.info(f"Media guruh ({media_group_id}) дан {deleted_count}/{len(message_ids_to_delete)} хабар яккама-якка ўчирилди.")
+                except telegram.error.Forbidden as e:
+                     logger.error(f"Media guruh ({media_group_id}) хабарларини ўчириш учун рухсат йўқ: {e}")
+                except Exception as e:
+                     logger.error(f"Media guruh ({media_group_id}) хабарларини ўчиришда кутилмаган хатолик: {e}")
             else:
                 logger.info(f"Media guruh ({media_group_id}) uchun o'chirish талаб қилинмаган.")
 
             # Гуруҳни кэшдан тозалаш
-            del self.media_group_cache[media_group_id]
-            logger.info(f"Media guruh ({media_group_id}) кэшдан тозаланди.")
+            # Агар cache'да ҳали ҳам мавжуд бўлса (пойга ҳолати бўлиши мумкин)
+            if media_group_id in self.media_group_cache:
+                del self.media_group_cache[media_group_id]
+                logger.info(f"Media guruh ({media_group_id}) кэшдан тозаланди.")
         else:
             logger.warning(f"process_media_group чақирилди, лекин media guruh ({media_group_id}) кэшда топилмади.")
 
@@ -376,7 +401,7 @@ class TelegramModerator:
     @owner_only # Фақат owner учун
     async def add_offensive_word(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
-            await update.message.reply_text("Iltimos, so'zni kiriting. Masalan: /addword yomon")
+            await update.message.reply_text("Iltimos, so'zni kiriting. Masalan: `/addword yomon so'z`", parse_mode='MarkdownV2')
             return
         word = " ".join(context.args).lower().strip()
         result = self.word_manager.add_word(word)
@@ -391,7 +416,7 @@ class TelegramModerator:
     @owner_only # Фақат owner учун
     async def remove_offensive_word(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not context.args:
-            await update.message.reply_text("Iltimos, o'chirish kerak bo'lgan so'zni kiriting. Masalan: /removeword yomon")
+            await update.message.reply_text("Iltimos, o'chirish kerak bo'lgan so'zni kiriting. Masalan: `/removeword yomon so'z`", parse_mode='MarkdownV2')
             return
         word = " ".join(context.args).lower().strip()
         result = self.word_manager.remove_word(word)
@@ -404,154 +429,185 @@ class TelegramModerator:
             await update.message.reply_text(f"❌ '{word}' so'zini o'chirishda xatolik yuz berdi.")
 
     @owner_only # Фақат owner учун (шахсий чатда ишлайди)
-    async def show_offensive_words(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=None):
-        # Бу функцияни энди update.message орқали чақирамиз, query орқали эмас
+    async def show_offensive_words(self, update: Update, context: ContextTypes.DEFAULT_TYPE, page=0): # Стандарт page=0
         message_or_query = update.callback_query.message if update.callback_query else update.message
+        is_callback = update.callback_query is not None
 
-        logger.info("show_offensive_words funksiyasi chaqirildi")
-        offensive_words = self.word_manager.get_words()
-        word_count = len(offensive_words) # Базага қайта сўров жўнатмаймиз
+        logger.info(f"show_offensive_words chaqirildi (page={page}, is_callback={is_callback})")
+        offensive_words = self.word_manager.get_words() # Янгилари биринчи келади
+        word_count = len(offensive_words)
         logger.info(f"Haqoratli so'zlar soni: {word_count}")
 
         if not offensive_words:
-            await message_or_query.reply_text("Haqoratli so'zlar ro'yxati bo'sh.")
+            text = "Haqoratli so'zlar ro'yxati bo'sh."
+            if is_callback:
+                await update.callback_query.edit_message_text(text)
+            else:
+                await message_or_query.reply_text(text)
             return
 
         total_pages = (word_count + self.words_per_page - 1) // self.words_per_page
-        if page is None:
-            # Агар page берилмаса ва бу callback query бўлмаса, охирги саҳифани кўрсатамиз
-             if not update.callback_query:
-                 page = max(0, total_pages - 1)
-             else:
-                  page = 0 # Callback'да page аниқ келади, бу ҳолат кузатилмаслиги керак
-        else:
-             page = max(0, min(page, total_pages - 1)) # Саҳифа чегараларини текшириш
+        current_page = max(0, min(page, total_pages - 1)) # Саҳифа чегараларини текшириш
 
-        start_idx = page * self.words_per_page
+        start_idx = current_page * self.words_per_page
         end_idx = min(start_idx + self.words_per_page, word_count)
         page_words = offensive_words[start_idx:end_idx]
 
-        message_text = f"Haqoratli so'zlar ro'yxati ({page + 1}/{total_pages} sahifa, Jami: {word_count}):\n"
+        # MarkdownV2 учун махсус белгиларни escape қилиш
+        def escape_md(text):
+             escape_chars = r'_*[]()~`>#+-=|{}.!'
+             return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
+        message_text = f"*Haqoratli so'zlar ro'yxati* ({current_page + 1}/{total_pages} sahifa, Jami: {word_count}):\n"
         if page_words:
-             message_text += "```\n" # Код блокида чиройли кўриниши учун
-             message_text += "\n".join(page_words)
-             message_text += "\n```"
+            # Сўзларни рақамлаб чиқариш
+            message_text += "```\n"
+            for i, word in enumerate(page_words, start=start_idx + 1):
+                 # Ҳар бир сўзни escape қилиш шарт эмас, чунки улар код блоки ичида
+                 message_text += f"{i}. {word}\n"
+            message_text += "```"
         else:
-             message_text += "_Bu sahifada so'zlar yo'q._"
+             # Бу ҳолат юз бермаслиги керак, лекин ҳар эҳтимолга қарши
+            message_text += "_Bu sahifada so'zlar yo'q\\._"
 
 
         keyboard_buttons = []
         row = []
-        if page > 0:
-            row.append(InlineKeyboardButton("⏪ Avvalgi", callback_data=f"prev_{page-1}")) # Тўғриланган page
-        if page < total_pages - 1:
-            row.append(InlineKeyboardButton("Keyingi ⏩", callback_data=f"next_{page+1}")) # Тўғриланган page
+        if current_page > 0:
+            row.append(InlineKeyboardButton("⏪ Avvalgi", callback_data=f"prev_{current_page-1}"))
+        if current_page < total_pages - 1:
+            row.append(InlineKeyboardButton("Keyingi ⏩", callback_data=f"next_{current_page+1}"))
         if row:
-             keyboard_buttons.append(row)
+            keyboard_buttons.append(row)
 
         reply_markup = InlineKeyboardMarkup(keyboard_buttons) if keyboard_buttons else None
 
         try:
-            # Агар бу callback query бўлса, хабарни таҳрирлаймиз
-            if update.callback_query:
-                 await update.callback_query.edit_message_text(message_text, reply_markup=reply_markup, parse_mode='MarkdownV2')
-                 logger.info(f"Sahifa {page + 1}/{total_pages} таҳрирланди.")
-            # Агар бу /showwords буйруғи бўлса, янги хабар юборамиз
-            else:
-                 await message_or_query.reply_text(message_text, reply_markup=reply_markup, parse_mode='MarkdownV2')
-                 logger.info(f"Sahifa {page + 1}/{total_pages} юборилди.")
-        except Exception as e:
-            logger.error(f"Ro'yxatni ko'rsatish/tahrirlashda xatolik: {e}")
-            # Агар Markdown хатоси бўлса, оддий текстда юбориб кўрамиз
-            try:
-                 fallback_text = f"Haqoratli so'zlar ro'yxati ({page + 1}/{total_pages} sahifa):\n" + "\n".join(page_words)
-                 if update.callback_query:
-                     await update.callback_query.edit_message_text(fallback_text, reply_markup=reply_markup)
+            if is_callback:
+                 # Агар матн ва тугмалар ўзгармаган бўлса, хато бермаслиги учун текшириш
+                 if update.callback_query.message.text != message_text or update.callback_query.message.reply_markup != reply_markup:
+                     await update.callback_query.edit_message_text(
+                         message_text,
+                         reply_markup=reply_markup,
+                         parse_mode='MarkdownV2'
+                     )
+                     logger.info(f"Sahifa {current_page + 1}/{total_pages} таҳрирланди.")
                  else:
-                     await message_or_query.reply_text(fallback_text, reply_markup=reply_markup)
-            except Exception as fallback_e:
-                 logger.error(f"Оддий текстда ҳам юборишда хатолик: {fallback_e}")
-                 await message_or_query.reply_text("❌ Ro'yxatni ko'rsatishда хатолик юз берди.")
+                      await update.callback_query.answer("Sahifa o'zgarmadi.") # Фойдаланувчига билдириш
+            else:
+                await message_or_query.reply_text(
+                    message_text,
+                    reply_markup=reply_markup,
+                    parse_mode='MarkdownV2'
+                )
+                logger.info(f"Sahifa {current_page + 1}/{total_pages} юборилди.")
+        except telegram.error.BadRequest as e:
+             if "Message is not modified" in str(e):
+                 logger.info("Хабар ўзгармаганлиги сабабли таҳрирланмади.")
+                 await update.callback_query.answer("Sahifa allaqachon ko'rsatilgan.")
+             else:
+                 logger.error(f"Ro'yxatni ko'rsatish/tahrirlashda BadRequest хатоси: {e}")
+                 await message_or_query.reply_text("❌ Ro'yxatni ko'rsatishда хатолик юз берди (BadRequest).")
+        except Exception as e:
+            logger.error(f"Ro'yxatni ko'rsatish/tahrirlashda кутилмаган хатолик: {e}", exc_info=True)
+            # Markdown хатоси бўлса, оддий текстда юбориб кўриш қийин, чунки escape керак
+            await message_or_query.reply_text("❌ Ro'yxatni ko'rsatishда хатолик юз берди.")
 
 
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer() # Тугма босилганлигини тасдиқлаш
+        # Тугма босилганлигини тасдиқлаш (жавоб бериш шарт)
+        await query.answer()
 
         data = query.data
         logger.info(f"Callback query олинди: {data}")
 
         try:
             action, page_str = data.split("_")
-            current_page = int(page_str)
+            page = int(page_str)
 
-            if action == "prev":
-                await self.show_offensive_words(update, context, page=current_page) # Янги page'ни берамиз
-            elif action == "next":
-                await self.show_offensive_words(update, context, page=current_page) # Янги page'ни берамиз
-            # Эски хабарни ўчирмаймиз, edit_message_text орқали таҳрирлаймиз
+            if action in ["prev", "next"]:
+                 # Айнан шу функцияни қайта чақирамиз, page аргументи билан
+                 await self.show_offensive_words(update, context, page=page)
         except Exception as e:
              logger.error(f"Callback query'ни ({data}) қайта ишлашда хато: {e}", exc_info=True)
 
 
-       async def handle_story(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-            if not update.story: # Асосан керак эмас, лекин текшириш яхши
-                logger.debug("Story update received but update.story is None.")
+    # ЯНГИ ФУНКЦИЯ: Ҳикояларни ушлаш ва ўчириш учун
+    async def handle_story(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.story or not update.story.from_user: # Ҳикоя ёки юборувчи йўқ бўлса
+            logger.debug("Story update received but story or user info is missing.")
+            return
+
+        story = update.story
+        user_id = story.from_user.id
+        chat_id = story.chat_id  # Ҳикоя қаерда кўринса (гуруҳ/канал/профил)
+        story_id = story.id      # Ҳикоянинг IDси
+
+        # OWNER_ID нинг ҳикояларини ўчирмаслик
+        if user_id == OWNER_ID:
+            # logger.debug(f"Owner's story (ID: {story_id}) ignored.")
+            return
+
+        logger.info(f"Story received in chat {chat_id} from user {user_id}. Story ID: {story_id}")
+
+        try:
+            # Бот фақат гуруҳлардаги (GROUP, SUPERGROUP) ҳикояларни ўчириши керак
+            chat = await context.bot.get_chat(chat_id)
+            if chat.type not in [Chat.GROUP, Chat.SUPERGROUP]:
+                logger.debug(f"Ignoring story {story_id} in non-group chat ({chat_id}, type: {chat.type}).")
                 return
-    
-            story = update.story
-            user_id = story.from_user.id
-            chat_id = story.chat_id  # Ҳикоя қаерда кўринса (гуруҳ/канал ёки фойдаланувчи профили)
-            story_id = story.id      # Ҳикоянинг IDси (ўчириш учун керак)
-    
-            logger.info(f"Story received in chat {chat_id} from user {user_id}. Story ID: {story_id}")
-    
-            try:
-                # Агар бу шахсий чат бўлса ёки каналдан келган ҳикоя бўлса, эътибор бермаймиз
-                # (Бот фақат гуруҳлардаги ҳикояларни ўчириши керак)
-                chat = await context.bot.get_chat(chat_id)
-                if chat.type == Chat.PRIVATE or chat.type == Chat.CHANNEL:
-                    logger.debug(f"Ignoring story {story_id} in private chat/channel {chat_id}.")
-                    return
-    
-                 # Гуруҳдаги админ/creator'ларни текширамиз
-                member = await context.bot.get_chat_member(chat_id, user_id)
-                if member.status in ['administrator', 'creator']:
-                    logger.info(f"User {user_id} is admin/creator in chat {chat_id}, not deleting story {story_id}.")
-                    return
-    
-                # Ҳикояни ўчириш
-                # Эътибор беринг: delete_story методи message_id параметрини кутади, лекин унга story.id берилади
-                deleted = await context.bot.delete_story(chat_id=chat_id, message_id=story_id)
-                if deleted:
-                    logger.info(f"Story (ID: {story_id}) deleted successfully from chat {chat_id} (sent by user {user_id}).")
-                else:
-                    # Бу ҳолат кам учрайди, лекин API False қайтариши мумкин
-                    logger.warning(f"Attempted to delete story (ID: {story_id}) from chat {chat_id}, but API returned False.")
-    
-            except telegram.error.Forbidden as e:
-                 logger.error(f"Permission error deleting story (ID: {story_id}) in chat {chat_id}. Does the bot have 'delete messages' permission? Error: {e}")
-            except Exception as e:
-                # Бошқа хатолар (масалан, ҳикоя аллақачон ўчирилган бўлса)
-                logger.error(f"Failed to process/delete story (ID: {story_id}) in chat {chat_id}: {e}", exc_info=True)
-    
+
+             # Гуруҳдаги админ/creator'ларни текширамиз
+            member = await context.bot.get_chat_member(chat_id, user_id)
+            if member.status in ['administrator', 'creator','left']:
+                logger.info(f"User {user_id} is admin/creator in chat {chat_id}, not deleting story {story_id}.")
+                return
+
+            # Ҳикояни ўчириш
+            # delete_story методи message_id параметрини кутади, унга story.id берилади
+            deleted = await context.bot.delete_story(chat_id=chat_id, message_id=story_id)
+            if deleted:
+                logger.info(f"Story (ID: {story_id}) deleted successfully from chat {chat_id} (sent by user {user_id}).")
+            else:
+                # API False қайтариши мумкин (масалан, аллақачон ўчирилган бўлса)
+                logger.warning(f"Attempted to delete story (ID: {story_id}) from chat {chat_id}, but API returned False (possibly already deleted?).")
+
+        except telegram.error.Forbidden as e:
+             logger.error(f"Permission error deleting story (ID: {story_id}) in chat {chat_id}. Does the bot have 'delete messages' permission? Error: {e}")
+        except telegram.error.BadRequest as e:
+             logger.error(f"Bad request deleting story (ID: {story_id}) in chat {chat_id}. Maybe story expired or already deleted? Error: {e}")
+        except Exception as e:
+            logger.error(f"Failed to process/delete story (ID: {story_id}) in chat {chat_id}: {e}", exc_info=True)
+
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-         user_id = update.effective_user.id
-         if update.effective_chat.type == Chat.PRIVATE and user_id != OWNER_ID:
-              await update.message.reply_text("Салом! Мен гуруҳ модераториман. Мени гуруҳга қўшинг ва админлик ҳуқуқини беринг.")
-         elif update.effective_chat.type == Chat.PRIVATE and user_id == OWNER_ID:
-              await update.message.reply_text(f"Салом, хўжайин! Мен ишлашга тайёрман.\n"
-                                              f"Мавжуд буйруқлар:\n"
-                                              f"/addword [сўз] - ҳақоратли сўз қўшиш\n"
-                                              f"/removeword [сўз] - ҳақоратли сўзни ўчириш\n"
-                                              f"/showwords - ҳақоратли сўзлар рўйхати")
-         else: # Гуруҳда /start ёзилса
-              await update.message.reply_text("Салом! Мен гуруҳингизни ҳақоратли сўзлар, рухсатсиз ҳаволалар ва APK файллардан тозалашга ёрдам бераман.")
+        user_id = update.effective_user.id
+        if update.effective_chat.type == Chat.PRIVATE and user_id != OWNER_ID:
+            await update.message.reply_text("Салом! Мен гуруҳ модераториман. Мени гуруҳга қўшинг ва хабарларни ўчириш ҳуқуқини беринг.")
+        elif update.effective_chat.type == Chat.PRIVATE and user_id == OWNER_ID:
+             # MarkdownV2 учун буйруқларни escape қилиш
+             add_cmd = escape_md("/addword [сўз]")
+             remove_cmd = escape_md("/removeword [сўз]")
+             show_cmd = escape_md("/showwords")
+             await update.message.reply_text(f"Салом, хўжайин\\! Мен ишлашга тайёрман\\.\n"
+                                             f"*Мавжуд буйруқлар:*\n"
+                                             f"{add_cmd} \\- ҳақоратли сўз қўшиш\n"
+                                             f"{remove_cmd} \\- ҳақоратли сўзни ўчириш\n"
+                                             f"{show_cmd} \\- ҳақоратли сўзлар рўйхати",
+                                             parse_mode='MarkdownV2')
+        else: # Гуруҳда /start ёзилса
+             await update.message.reply_text("Салом! Мен гуруҳингизни ҳақоратли сўзлар, рухсатсиз ҳаволалар, mention'лар, APK файллар ва ҳикоялардан тозалашга ёрдам бераман. Ишлашим учун 'Delete Messages' рухсатини беришни унутманг.")
 
 
 def main():
     logging.info("Бот ишга туширилмоқда...")
+    if not TOKEN or TOKEN == 'default_token':
+        logging.critical("TELEGRAM_BOT_TOKEN .env файлида топилмади ёки нотўғри!")
+        return
+    if OWNER_ID == 0:
+         logging.warning("OWNER_ID .env файлида топилмади ёки 0 га тенг! Баъзи буйруқлар ишламайди.")
+
 
     try:
         # Application'ни JobQueue билан яратамиз
@@ -560,36 +616,38 @@ def main():
         # Moderator'га application'ни узатамиз
         moderator = TelegramModerator(TOKEN, application)
 
-        # Буйруқ Handler'лари (owner_only декоратори билан)
+        # --- Handler'ларни қўшиш ---
+
+        # 1. Буйруқ Handler'лари (фақат owner учун - декоратор текширади)
         application.add_handler(CommandHandler('start', moderator.start_command))
         application.add_handler(CommandHandler('addword', moderator.add_offensive_word))
         application.add_handler(CommandHandler('removeword', moderator.remove_offensive_word))
         application.add_handler(CommandHandler('showwords', moderator.show_offensive_words))
 
-        # Callback Query Handler (пагинация учун)
+        # 2. Callback Query Handler (пагинация тугмалари учун)
         application.add_handler(CallbackQueryHandler(moderator.button_handler))
 
-        # Message Handler'лар (асосий текширув учун)
-        # Энг кенг тарқалган фильтрларни юқорига қўямиз
+        # 3. Асосий хабар Handler (текст, медиа, apk ва ҳ.к.)
+        #    ~filters.COMMAND - буйруқларни бу handler ушламаслиги учун
+        #    ~filters.UpdateType.EDITED - таҳрирланган хабарларни ушламаслик
+        #    ~filters.StatusUpdate - сервис хабарларини ушламаслик (joined, left,...)
         message_filters = (
-    filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.AUDIO |
-    filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL | filters.CONTACT |  # filters.STICKER ўрнига
-    filters.LOCATION | filters.VENUE | filters.POLL | filters.Document.ALL
-) & (~filters.UpdateType.EDITED_MESSAGE) & (~filters.StatusUpdate.WEB_APP_DATA)
+            filters.TEXT | filters.CAPTION | filters.PHOTO | filters.VIDEO | filters.AUDIO |
+            filters.VOICE | filters.VIDEO_NOTE | filters.Sticker.ALL | filters.CONTACT |
+            filters.LOCATION | filters.VENUE | filters.POLL | filters.Document.ALL
+        ) & (~filters.COMMAND) & (~filters.UpdateType.EDITED) & (~filters.StatusUpdate.ALL)
 
+        # Бу handler'ни check_message функциясига боғлаймиз
         application.add_handler(MessageHandler(message_filters, moderator.check_message))
 
-        # Story'ларни ўчириш учун алоҳида handler (аниқроқ фильтр билан)
-        # Агар library 'story' учун алоҳида фильтр тақдим этса, шуни ишлатган маъқул
-        # Ҳозирча эски усул қолади, лекин filters.ALL охирида туриши керак
-        # application.add_handler(MessageHandler(filters.STORY???, moderator.delete_stories_automatically)) # Агар шундай фильтр бўлса
-        # filters.ALL энг охирида қолади (агар юқоридагилар ишламаса)
-        # application.add_handler(MessageHandler(filters.ALL, moderator.delete_stories_automatically))
+        # 4. Ҳикоя (Story) Handler
+        #    Бу handler фақат ҳикояларни ушлайди ва handle_story функциясига юборади
         application.add_handler(MessageHandler(filters.UpdateType.STORY, moderator.handle_story))
 
-
+        # --- Ботни ишга тушириш ---
         logging.info("Бот polling режимида ишга тушди.")
-        application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES) # Барча турдаги update'ларни қабул қилиш
+        # Барча турдаги update'ларни қабул қилиш (бу handler'лар орқали филтрланади)
+        application.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
     except Exception as e:
         logging.critical(f"Ботни ишга туширишда критик хатолик: {e}", exc_info=True)
