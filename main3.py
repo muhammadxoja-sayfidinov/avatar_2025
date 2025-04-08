@@ -494,30 +494,47 @@ class TelegramModerator:
              logger.error(f"Callback query'ни ({data}) қайта ишлашда хато: {e}", exc_info=True)
 
 
-    async def delete_stories_automatically(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Бу функция асосан ўзгаришсиз қолади, лекин check_message'дан олдин ишламаслиги керак
-        # Агар story хабарини алоҳида ушламоқчи бўлсак, алоҳида handler керак
-        # Ҳозирги ҳолатда filters.ALL охирида тургани маъқул
-        try:
-            # Story хабари эканлигини текширишнинг ишончли усули керак бўлиши мумкин
-            # Бу ерда update.message.story мавжудлиги тахмин қилинмоқда
-            if update.message and hasattr(update.message, 'story') and update.message.story:
-                user_id = update.message.from_user.id
-                chat_id = update.message.chat_id
-                message_id = update.message.message_id
-
-                # Админ ва creator'ларни текшириш (гуруҳларда)
-                if update.message.chat.type != Chat.PRIVATE:
-                     member = await context.bot.get_chat_member(chat_id, user_id)
-                     if member.status in ['administrator', 'creator','left']:
-                         return # Админларникини ўчирмаймиз
-
-                await update.message.delete()
-                logger.info(f"Story (ID: {message_id}) avtomatik o'chirildi. User ID: {user_id}")
-        except AttributeError:
-             pass # 'story' атрибути бўлмаса, индамаймиз
-        except Exception as e:
-            logger.error(f"Hikoyalarni o'chirishда умумий xatolik: {e}")
+       async def handle_story(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+            if not update.story: # Асосан керак эмас, лекин текшириш яхши
+                logger.debug("Story update received but update.story is None.")
+                return
+    
+            story = update.story
+            user_id = story.from_user.id
+            chat_id = story.chat_id  # Ҳикоя қаерда кўринса (гуруҳ/канал ёки фойдаланувчи профили)
+            story_id = story.id      # Ҳикоянинг IDси (ўчириш учун керак)
+    
+            logger.info(f"Story received in chat {chat_id} from user {user_id}. Story ID: {story_id}")
+    
+            try:
+                # Агар бу шахсий чат бўлса ёки каналдан келган ҳикоя бўлса, эътибор бермаймиз
+                # (Бот фақат гуруҳлардаги ҳикояларни ўчириши керак)
+                chat = await context.bot.get_chat(chat_id)
+                if chat.type == Chat.PRIVATE or chat.type == Chat.CHANNEL:
+                    logger.debug(f"Ignoring story {story_id} in private chat/channel {chat_id}.")
+                    return
+    
+                 # Гуруҳдаги админ/creator'ларни текширамиз
+                member = await context.bot.get_chat_member(chat_id, user_id)
+                if member.status in ['administrator', 'creator']:
+                    logger.info(f"User {user_id} is admin/creator in chat {chat_id}, not deleting story {story_id}.")
+                    return
+    
+                # Ҳикояни ўчириш
+                # Эътибор беринг: delete_story методи message_id параметрини кутади, лекин унга story.id берилади
+                deleted = await context.bot.delete_story(chat_id=chat_id, message_id=story_id)
+                if deleted:
+                    logger.info(f"Story (ID: {story_id}) deleted successfully from chat {chat_id} (sent by user {user_id}).")
+                else:
+                    # Бу ҳолат кам учрайди, лекин API False қайтариши мумкин
+                    logger.warning(f"Attempted to delete story (ID: {story_id}) from chat {chat_id}, but API returned False.")
+    
+            except telegram.error.Forbidden as e:
+                 logger.error(f"Permission error deleting story (ID: {story_id}) in chat {chat_id}. Does the bot have 'delete messages' permission? Error: {e}")
+            except Exception as e:
+                # Бошқа хатолар (масалан, ҳикоя аллақачон ўчирилган бўлса)
+                logger.error(f"Failed to process/delete story (ID: {story_id}) in chat {chat_id}: {e}", exc_info=True)
+    
 
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
          user_id = update.effective_user.id
@@ -568,6 +585,7 @@ def main():
         # application.add_handler(MessageHandler(filters.STORY???, moderator.delete_stories_automatically)) # Агар шундай фильтр бўлса
         # filters.ALL энг охирида қолади (агар юқоридагилар ишламаса)
         # application.add_handler(MessageHandler(filters.ALL, moderator.delete_stories_automatically))
+        application.add_handler(MessageHandler(filters.UpdateType.STORY, moderator.handle_story))
 
 
         logging.info("Бот polling режимида ишга тушди.")
